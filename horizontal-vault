@@ -1,0 +1,170 @@
+#!/bin/bash
+set -e
+set -x
+set -o pipefail
+
+usage() {
+  cat <<EOF
+Usage: $0 <command> [subcommand] [options]
+
+Commands:
+  root init           Initialize a stable base vault and export root credentials.
+  seed build          Build a portable seed vault and manage transit keys.
+  seed key add <name> Add a transit key.
+  seed key list       List transit keys.
+  seed key rm <name>  Remove a transit key.
+  data build          Launch a data mode vault (read-only).
+
+Examples:
+  $0 root init
+  $0 seed build
+  $0 seed key add my-key
+  $0 seed key list
+  $0 seed key rm my-key
+  $0 data build
+EOF
+  exit 1
+}
+
+# Run a Vault container with the proper mounts and environment.
+run_vault_container() {
+  local mode="$1"
+  local cmd="${2:-/vault/entrypoint.sh}"
+  docker run --rm \
+    -v "$PWD/seed_data:/vault/file" \
+    -e VAULT_MODE="$mode" \
+    horizontal-vault $cmd
+}
+
+# Command functions
+
+root_init() {
+  echo "Initializing stable base vault..."
+  # In base mode, the container will:
+  # - Initialize Vault (if not already initialized).
+  # - Unseal Vault.
+  # - Dump root credentials to /vault/file/root_creds.json.
+  run_vault_container "base"
+  echo "Base vault initialized. Root credentials exported to $FILE_DIR/root_creds.json"
+}
+
+seed_build() {
+  echo "Building portable seed vault..."
+  # In seed mode, the container will:
+  # - Check for existing base data.
+  # - Unseal Vault if necessary.
+  # - Enable the transit secrets engine.
+  # - Create and backup the shared transit key.
+  run_vault_container "seed"
+  echo "Portable seed vault built (using persisted data in $FILE_DIR)."
+}
+
+data_build() {
+  echo "Launching data mode vault..."
+  # In data mode, the container will:
+  # - Unseal Vault if necessary.
+  # - Enable the transit engine.
+  # - Restore the shared transit key from backup.
+  run_vault_container "data"
+  echo "Data vault launched (using persisted credentials and transit key backup)."
+}
+
+seed_key_add() {
+  local key_name="$1"
+  if [ -z "$key_name" ]; then
+    echo "Error: Missing key name for 'seed key add'."
+    usage
+  fi
+  echo "Adding transit key '$key_name'..."
+  # Run a one-off Vault command in SEED mode.
+  run_vault_container "seed" "sh -c 'vault login \$(jq -r \".root_token\" /vault/file/root_creds.json) && vault write -f transit/keys/${key_name} exportable=true allow_plaintext_backup=true'"
+  echo "Transit key '$key_name' added successfully."
+}
+
+seed_key_list() {
+  echo "Listing transit keys..."
+  run_vault_container "seed" "sh -c 'vault login \$(jq -r \".root_token\" /vault/file/root_creds.json) && vault list transit/keys'"
+}
+
+seed_key_rm() {
+  local key_name="$1"
+  if [ -z "$key_name" ]; then
+    echo "Error: Missing key name for 'seed key rm'."
+    usage
+  fi
+  echo "Removing transit key '$key_name'..."
+  # Note: Vault doesn't offer a dedicated "rm" for transit keys.
+  run_vault_container "seed" "sh -c 'vault login \$(jq -r \".root_token\" /vault/file/root_creds.json) && vault delete transit/keys/${key_name}'"
+  echo "Transit key '$key_name' removed successfully."
+}
+
+# Validate command-line arguments
+if [ "$#" -lt 2 ]; then
+  usage
+fi
+
+command="$1"
+subcommand="$2"
+shift 2
+
+case "$command" in
+  root)
+    case "$subcommand" in
+      init)
+        root_init "$@"
+        ;;
+      *)
+        echo "Unknown subcommand for 'root': $subcommand"
+        usage
+        ;;
+    esac
+    ;;
+  seed)
+    case "$subcommand" in
+      build)
+        seed_build "$@"
+        ;;
+      key)
+        if [ "$#" -lt 1 ]; then
+          usage
+        fi
+        key_cmd="$1"
+        shift
+        case "$key_cmd" in
+          add)
+            seed_key_add "$@"
+            ;;
+          list)
+            seed_key_list "$@"
+            ;;
+          rm)
+            seed_key_rm "$@"
+            ;;
+          *)
+            echo "Unknown subcommand for 'seed key': $key_cmd"
+            usage
+            ;;
+        esac
+        ;;
+      *)
+        echo "Unknown subcommand for 'seed': $subcommand"
+        usage
+        ;;
+    esac
+    ;;
+  data)
+    case "$subcommand" in
+      build)
+        data_build "$@"
+        ;;
+      *)
+        echo "Unknown subcommand for 'data': $subcommand"
+        usage
+        ;;
+    esac
+    ;;
+  *)
+    echo "Unknown command: $command"
+    usage
+    ;;
+esac
